@@ -1,5 +1,4 @@
 from scrapy.dupefilters import RFPDupeFilter
-from scrapy.utils.job import job_dir
 from w3lib.url import canonicalize_url
 from scrapy.utils.python import to_bytes
 import weakref
@@ -10,11 +9,16 @@ import re
 _fingerprint_cache = weakref.WeakKeyDictionary()
 
 
-class CustomDupeFilter(RFPDupeFilter):
-    def request_fingerprint(self, request, remove_scheme=None):
-        return self.custom_request_fingerprint(request,
-                                               remove_scheme=remove_scheme)
+def _job_dir(settings):
+    """Return the JOBDIR setting (None when persistence is disabled).
 
+    scrapy.utils.job.job_dir was removed/deprecated in recent Scrapy
+    versions, only the setting lookup is needed here.
+    """
+    return settings.get('JOBDIR')
+
+
+class CustomDupeFilter(RFPDupeFilter):
     def custom_request_fingerprint(self, request, include_headers=None,
                                    remove_scheme=None):
         """
@@ -60,14 +64,23 @@ class CustomDupeFilter(RFPDupeFilter):
         super(CustomDupeFilter, self).__init__(path=path, debug=debug)
         # Spread config bool
         self.use_anchors = use_anchors
-        self.fingerprints_with_scheme = set()  # This set will not be scheme agnostic
+        # Scheme agnostic fingerprints (hex strings)
+        self.schemeless_fingerprints = set()
+        # This set will not be scheme agnostic
+        self.fingerprints_with_scheme = set()
 
-    # Overridden method in order to add the use_anchors attribute
+    @classmethod
+    def from_crawler(cls, crawler):
+        debug = crawler.settings.getbool('DUPEFILTER_DEBUG')
+        use_anchors = crawler.settings.getbool('DUPEFILTER_USE_ANCHORS')
+        return cls(_job_dir(crawler.settings), debug, use_anchors)
+
+    # Kept for backward compatibility with older Scrapy versions
     @classmethod
     def from_settings(cls, settings):
         debug = settings.getbool('DUPEFILTER_DEBUG')
         use_anchors = settings.getbool('DUPEFILTER_USE_ANCHORS')
-        return cls(job_dir(settings), debug, use_anchors)
+        return cls(_job_dir(settings), debug, use_anchors)
 
     def request_seen(self, request):
         """
@@ -77,8 +90,9 @@ class CustomDupeFilter(RFPDupeFilter):
         - avoid loop in redirection by keeping a dedicated track of it
         """
 
-        fp = self.request_fingerprint(request, remove_scheme=True)
-        fp_with_scheme = self.request_fingerprint(request, remove_scheme=False)
+        fp = self.custom_request_fingerprint(request, remove_scheme=True)
+        fp_with_scheme = self.custom_request_fingerprint(request,
+                                                         remove_scheme=False)
         # Request from a redirection which is followed byt he RedirectionMiddleware
         isRedirected = request.meta.get('redirect_times') and request.meta.get(
             'redirect_times') > 0
@@ -89,15 +103,17 @@ class CustomDupeFilter(RFPDupeFilter):
                 return True
             self.fingerprints_with_scheme.add(fp_with_scheme)
             # We don't want go back onto the visited web page, especially when it isn't from a redirection
-            if fp not in self.fingerprints:
+            if fp not in self.schemeless_fingerprints:
                 self.register_fingerprint(fp)
         else:
-            if fp in self.fingerprints:
+            if fp in self.schemeless_fingerprints:
                 return True
             self.register_fingerprint(fp)
             self.fingerprints_with_scheme.add(fp_with_scheme)
 
     def register_fingerprint(self, fp):
-        self.fingerprints.add(fp)
+        self.schemeless_fingerprints.add(fp)
         if self.file:
-            self.file.write(fp + os.linesep)
+            # Keep the binary, length-prefixed format used by Scrapy >= 2.6
+            fp_bytes = bytes.fromhex(fp)
+            self.file.write(len(fp_bytes).to_bytes(2, 'big') + fp_bytes)

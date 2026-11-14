@@ -1,21 +1,28 @@
 """AlgoliaHelper
 Wrapper on top of the AlgoliaSearch API client"""
 
-from algoliasearch.search_client import SearchClient
-
 from builtins import range
 
 
 class AlgoliaHelper:
     """AlgoliaHelper"""
 
-    def __init__(self, app_id, api_key, index_name, index_name_tmp, settings, query_rules):
-        self.algolia_client = SearchClient.create(app_id, api_key)
+    def __init__(self, app_id, api_key, index_name, index_name_tmp, settings,
+                 query_rules, algolia_client=None):
+        if algolia_client is None:
+            # Imported lazily so a client can be injected (e.g. a fake one in
+            # tests) without requiring the algoliasearch package
+            from algoliasearch.search_client import SearchClient
+            algolia_client = SearchClient.create(app_id, api_key)
+        self.algolia_client = algolia_client
         self.index_name = index_name
         self.index_name_tmp = index_name_tmp
         self.algolia_index = self.algolia_client.init_index(self.index_name)
         self.algolia_index_tmp = self.algolia_client.init_index(
             self.index_name_tmp)
+        # Every run starts from an empty temporary index: records left behind
+        # by a previous failed or cancelled run must never be committed
+        self.clear_tmp_index()
         self.algolia_client.copy_rules(
             self.index_name,
             self.index_name_tmp
@@ -47,6 +54,10 @@ class AlgoliaHelper:
         print(
             '\033[94m> DocSearch: \033[0m Synonyms (\033[93m{} synonyms\033[0m)'.format(
                 len(synonyms_list)))
+
+    def clear_tmp_index(self):
+        """Drop every record from the temporary index"""
+        self.algolia_index_tmp.clear_objects()
 
     def commit_tmp_index(self):
         """Overwrite the real index with the temporary one"""

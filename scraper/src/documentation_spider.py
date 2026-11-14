@@ -18,6 +18,13 @@ from scrapy.spidermiddlewares.httperror import HttpError
 from scrapy.exceptions import CloseSpider
 
 EXIT_CODE_EXCEEDED_RECORDS = 4
+EXIT_CODE_SEED_FAILURE = 6
+EXIT_CODE_PAGE_FAILURE = 7
+EXIT_CODE_CRAWL_INTERRUPTED = 8
+
+# Crawl stages used to report where a failure happened
+STAGE_SEED = 'seed'
+STAGE_PAGE = 'page'
 
 
 class DocumentationSpider(CrawlSpider, SitemapSpider):
@@ -35,6 +42,10 @@ class DocumentationSpider(CrawlSpider, SitemapSpider):
     # Could be any url prefix such as http://www or http://
     every_schemes = ["http", "https"]
     reason_to_stop = None
+    # Per-run crawl outcome, reset by run_config before every crawl
+    crawl_errors = []
+    nb_hits_exceeded = False
+    close_reason = None
 
     @staticmethod
     def to_any_scheme(url):
@@ -95,7 +106,7 @@ class DocumentationSpider(CrawlSpider, SitemapSpider):
 
         DocumentationSpider.rules = [
             Rule(link_extractor, callback=self.parse_from_start_url,
-                 follow=True),
+                 follow=True, errback=self.errback_page),
         ]
 
         # START _init_ part from SitemapSpider
@@ -112,7 +123,7 @@ class DocumentationSpider(CrawlSpider, SitemapSpider):
                     sitemap_rules.append((regex, 'parse_from_sitemap'))
             else:  # Neither start url nor regex: default, we parse all
                 print("Neither start url nor regex: default, we scrap all")
-                sitemap_rules = [('.*', 'parse_from_sitemap')]
+                sitemap_rules.append(('.*', 'parse_from_sitemap'))
 
             self.__init_sitemap_(config.sitemap_urls, sitemap_rules,
                                  config.sitemap_alternate_links)
@@ -135,7 +146,7 @@ class DocumentationSpider(CrawlSpider, SitemapSpider):
         # We crawl the start URL in order to ensure we didn't miss anything (Even if we used the sitemap)
         for url in self.start_urls:
             yield Request(url,
-                          callback=self.parse_from_start_url if self.scrape_start_urls else self.parse,
+                          callback=self.parse_from_start_url if self.scrape_start_urls else self._parse,
                           # If we wan't to crawl (default behavior) without scraping, we still need to let the
                           # crawling spider acknowledge the content by parsing it with the built-in method
                           meta={
@@ -143,6 +154,46 @@ class DocumentationSpider(CrawlSpider, SitemapSpider):
                                   url)
                           },
                           errback=self.errback_alternative_link)
+
+    async def start(self):
+        # Scrapy >= 2.13 entry point (start_requests is kept for older ones)
+        for request in self.start_requests():
+            yield request
+
+    def closed(self, reason):
+        # Record why the crawl ended so run_config can tell a complete crawl
+        # ('finished') from an interrupted or aborted one
+        DocumentationSpider.close_reason = reason
+
+    @staticmethod
+    def record_crawl_error(url, stage, reason):
+        """Track a crawl failure (url, stage and reason) for the final report"""
+        DocumentationSpider.crawl_errors.append({
+            'url': url,
+            'stage': stage,
+            'reason': reason
+        })
+        print(
+            '\033[91m> DocSearch: crawl error\033[0m [stage: {}] {} ({})'.format(
+                stage, url, reason))
+
+    @staticmethod
+    def _failure_reason(failure):
+        """Human readable reason for a twisted Failure"""
+        if failure.check(HttpError):
+            return 'HTTP {}'.format(failure.value.response.status)
+        return '{}: {}'.format(failure.type.__name__,
+                               failure.getErrorMessage()[:200])
+
+    def errback_page(self, failure):
+        """
+        Error callback for crawled pages (link-extracted or sitemap urls):
+        any page that cannot be fetched (HTTP error, timeout, DNS, ...) is
+        recorded and will prevent the temporary index from being committed
+        """
+        url = failure.request.url if failure.request is not None else '?'
+        self.record_crawl_error(url, STAGE_PAGE,
+                                DocumentationSpider._failure_reason(failure))
 
     def add_records(self, response, from_sitemap):
         records = self.strategy.get_records_from_response(response)
@@ -152,11 +203,12 @@ class DocumentationSpider(CrawlSpider, SitemapSpider):
 
         # Arbitrary limit
         if self.nb_hits_max > 0 and DocumentationSpider.NB_INDEXED > self.nb_hits_max:
-            DocumentationSpider.NB_INDEXED = 0
+            DocumentationSpider.nb_hits_exceeded = True
             self.reason_to_stop = "Too much hits, DocSearch only handle {} records".format(
                 int(self.nb_hits_max))
-            raise ValueError(self.reason_to_stop)
-            exit(EXIT_CODE_EXCEEDED_RECORDS)
+            # Abort the crawl: the partial temporary index must not be
+            # committed over the production one
+            raise CloseSpider(reason=self.reason_to_stop)
 
     def parse_from_sitemap(self, response):
         if self.reason_to_stop is not None:
@@ -179,7 +231,7 @@ class DocumentationSpider(CrawlSpider, SitemapSpider):
         else:
             print("\033[94m> Ignored: from start url\033[0m " + response.url)
 
-        return self.parse(response)
+        return self._parse(response)
 
     def is_rules_compliant(self, response):
 
@@ -192,16 +244,16 @@ class DocumentationSpider(CrawlSpider, SitemapSpider):
 
         for rule in self._rules:
             if not self.strict_redirect:
-                if rule.link_extractor._link_allowed(response):
+                if rule.link_extractor.matches(response.url):
                     continue
 
-                if rule.link_extractor._link_allowed(response.request):
+                if rule.link_extractor.matches(response.request.url):
                     response.replace(url=response.request.url)
                     continue
             else:
-                if rule.link_extractor._link_allowed(
-                        response) and rule.link_extractor._link_allowed(
-                    response.request):
+                if rule.link_extractor.matches(
+                        response.url) and rule.link_extractor.matches(
+                    response.request.url):
                     continue
             return False
 
@@ -235,8 +287,25 @@ class DocumentationSpider(CrawlSpider, SitemapSpider):
                     url=alternative_link,
                     meta=meta
                 )
+                return
 
                 # Other check available such as DNSLookupError, TimeoutError, TCPTimedOutError)...
+
+        # No alternative scheme left to try (or a hard failure such as a
+        # timeout): the seed could not be fetched, the crawl is incomplete
+        self.record_crawl_error(
+            failure.request.url if failure.request is not None else '?',
+            STAGE_SEED,
+            DocumentationSpider._failure_reason(failure))
+
+    def sitemap_request(self, loc, callback, entry, *, source, response):
+        """Attach the page errback to every url found in a sitemap so that
+        failing pages are tracked like link-extracted ones"""
+        request = super(DocumentationSpider, self).sitemap_request(
+            loc, callback, entry, source=source, response=response)
+        if source == "urlset":
+            request.errback = self.errback_page
+        return request
 
     def __init_sitemap_(self, sitemap_urls, custom_sitemap_rules,
                         sitemap_alternate_links):

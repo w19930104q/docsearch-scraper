@@ -6,7 +6,17 @@ Load the config json file.
 """
 
 from collections import OrderedDict
-from distutils.util import strtobool
+try:
+    from distutils.util import strtobool
+except ImportError:
+    # distutils was removed from the stdlib in Python 3.12
+    def strtobool(val):
+        val = val.lower()
+        if val in ('y', 'yes', 't', 'true', 'on', '1'):
+            return 1
+        if val in ('n', 'no', 'f', 'false', 'off', '0'):
+            return 0
+        raise ValueError("invalid truth value %r" % (val,))
 import json
 import os
 import copy

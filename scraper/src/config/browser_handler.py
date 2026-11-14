@@ -1,8 +1,6 @@
 import re
 import os
-from selenium import webdriver
 
-from selenium.webdriver.chrome.options import Options
 from ..custom_downloader_middleware import CustomDownloaderMiddleware
 from ..js_executor import JsExecutor
 
@@ -21,6 +19,11 @@ class BrowserHandler:
 
         if BrowserHandler.conf_need_browser(config_original_content,
                                             js_render):
+            # Imported lazily: selenium is only required when js_render (or
+            # config variables) actually need a real browser
+            from selenium import webdriver
+            from selenium.webdriver.chrome.options import Options
+
             chrome_options = Options()
             chrome_options.add_argument('--no-sandbox')
             chrome_options.add_argument('--headless')
